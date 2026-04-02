@@ -35,7 +35,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     model_args = ckpt.get("args", {})
-    model = CGTCNet(in_ch=6, d_model=model_args.get("d_model", 128), seq_backbone=model_args.get("seq_backbone", "tcn"))
+    model = CGTCNet(
+        in_ch=6,
+        d_model=model_args.get("d_model", 128),
+        seq_backbone=model_args.get("seq_backbone", "tcn"),
+        mamba_layers=model_args.get("mamba_layers", 3),
+    )
     model.load_state_dict(ckpt["model"], strict=True)
     model.to(device).eval()
 

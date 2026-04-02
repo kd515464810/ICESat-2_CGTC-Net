@@ -23,8 +23,6 @@ class PointBinEncoder(nn.Module):
         )
 
     def forward(self, features_obs: torch.Tensor, masks_obs: torch.Tensor):
-        # features_obs: [B, L, P, F]
-        B, L, P, _ = features_obs.shape
         point_feat = self.point_mlp(features_obs)
         masked = point_feat.masked_fill(masks_obs.unsqueeze(-1) <= 0, -1e4)
         bin_feat = masked.max(dim=2).values
@@ -48,25 +46,82 @@ class TCNBackbone(nn.Module):
         return self.net(x.transpose(1, 2)).transpose(1, 2)
 
 
-class MambaLikeFallback(nn.Module):
-    """Fallback when mamba_ssm is unavailable; keeps interface stable."""
+class _MambaCell(nn.Module):
+    """Single sequence cell with automatic fallback when mamba_ssm is unavailable."""
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int):
         super().__init__()
         try:
             from mamba_ssm import Mamba  # type: ignore
 
-            self.block = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+            self.cell = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
             self.using_real_mamba = True
         except Exception:
-            self.block = nn.GRU(d_model, d_model, batch_first=True, bidirectional=False)
+            self.cell = nn.GRU(d_model, d_model, batch_first=True)
             self.using_real_mamba = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.using_real_mamba:
-            return self.block(x)
-        out, _ = self.block(x)
+            return self.cell(x)
+        out, _ = self.cell(x)
         return out
+
+
+class BiMambaLayer(nn.Module):
+    """Bidirectional Mamba layer for non-causal along-track terrain reasoning."""
+
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.fwd = _MambaCell(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.bwd = _MambaCell(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.fuse = nn.Linear(d_model * 2, d_model)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+
+    @property
+    def using_real_mamba(self) -> bool:
+        return bool(getattr(self.fwd, "using_real_mamba", False) and getattr(self.bwd, "using_real_mamba", False))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        h_fwd = self.fwd(h)
+        h_bwd = torch.flip(self.bwd(torch.flip(h, dims=[1])), dims=[1])
+        h = self.fuse(torch.cat([h_fwd, h_bwd], dim=-1))
+        x = x + h
+        x = x + self.ffn(x)
+        return x
+
+
+class MambaBackbone(nn.Module):
+    """Stacked bidirectional Mamba backbone with local convolutional stem."""
+
+    def __init__(self, d_model: int, n_layers: int = 3):
+        super().__init__()
+        self.local_stem = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+        self.layers = nn.ModuleList([BiMambaLayer(d_model=d_model) for _ in range(n_layers)])
+        self.out_norm = nn.LayerNorm(d_model)
+
+    @property
+    def using_real_mamba(self) -> bool:
+        return all(getattr(layer, "using_real_mamba", False) for layer in self.layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, D]
+        stem = self.local_stem(x.transpose(1, 2)).transpose(1, 2)
+        h = x + stem
+        for layer in self.layers:
+            h = layer(h)
+        return self.out_norm(h)
 
 
 class MultiScaleUNet1D(nn.Module):
@@ -77,7 +132,6 @@ class MultiScaleUNet1D(nn.Module):
         self.dec = nn.Conv1d(d_model * 2, d_model, 3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, L, C]
         x = x.transpose(1, 2)
         e1 = F.relu(self.enc1(x), inplace=True)
         e2 = F.relu(self.enc2(F.avg_pool1d(e1, kernel_size=2, stride=2)), inplace=True)
@@ -117,12 +171,12 @@ class FusionDecoder(nn.Module):
 
 
 class CGTCNet(nn.Module):
-    def __init__(self, in_ch: int = 6, d_model: int = 128, seq_backbone: str = "tcn", num_classes: int = 4):
+    def __init__(self, in_ch: int = 6, d_model: int = 128, seq_backbone: str = "tcn", num_classes: int = 4, mamba_layers: int = 3):
         super().__init__()
         self.encoder = PointBinEncoder(in_ch, d_model)
         self.seq_backbone = seq_backbone
         if seq_backbone == "mamba":
-            self.backbone = MambaLikeFallback(d_model)
+            self.backbone = MambaBackbone(d_model=d_model, n_layers=mamba_layers)
         else:
             self.backbone = TCNBackbone(d_model)
 
@@ -131,10 +185,13 @@ class CGTCNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(d_model, num_classes),
         )
-
         self.canopy_stream = MultiScaleUNet1D(5, d_model)
         self.anchor_stream = AnchorPropagation(d_model)
         self.decoder = FusionDecoder(d_model)
+
+    @property
+    def using_real_mamba(self) -> bool:
+        return bool(self.seq_backbone == "mamba" and getattr(self.backbone, "using_real_mamba", False))
 
     def forward(self, features_obs: torch.Tensor, masks_obs: torch.Tensor, ground_anchor_gt: torch.Tensor, anchor_valid_mask: torch.Tensor):
         point_feat, bin_feat = self.encoder(features_obs, masks_obs)
@@ -145,7 +202,6 @@ class CGTCNet(nn.Module):
         point_logits = self.point_cls_head(torch.cat([point_feat, seq_expand], dim=-1))
         point_probs = F.softmax(point_logits, dim=-1)
 
-        # canopy envelope from predicted canopy/top classes + z distribution
         z = features_obs[..., 1]
         canopy_prob = point_probs[..., 1] + point_probs[..., 2]
         canopy_mask = canopy_prob * masks_obs
@@ -199,7 +255,6 @@ class FocalLoss(nn.Module):
 
 
 def soft_dtw_approx(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # Lightweight differentiable shape proxy via smoothed absolute sequence mismatch.
     diff = (x - y).abs()
     diff = torch.log1p(torch.exp(5 * diff)) / 5.0
     valid = mask > 0

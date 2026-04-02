@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--seq_backbone", type=str, default="tcn", choices=["tcn", "mamba"])
     parser.add_argument("--save_path", type=str, default="checkpoints/cgtc_net.pt")
+    parser.add_argument("--mamba_layers", type=int, default=3)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -73,7 +74,9 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    model = CGTCNet(in_ch=6, d_model=args.d_model, seq_backbone=args.seq_backbone).to(device)
+    model = CGTCNet(in_ch=6, d_model=args.d_model, seq_backbone=args.seq_backbone, mamba_layers=args.mamba_layers).to(device)
+    if args.seq_backbone == "mamba":
+        print(f"[Backbone] mamba requested, real_mamba={model.using_real_mamba}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     best_rmse = 1e9
