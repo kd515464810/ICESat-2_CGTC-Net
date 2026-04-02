@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -55,10 +58,56 @@ def run_epoch(model, loader, optimizer, device, train=True):
     return meter
 
 
+def maybe_prepare_data(args):
+    if not args.prepare_if_missing:
+        return
+
+    train_pkl = Path(args.train_pkl)
+    val_pkl = Path(args.val_pkl)
+    if train_pkl.exists() and val_pkl.exists():
+        return
+
+    raw_dir = Path(args.raw_dir)
+    out_dir = Path(args.processed_dir)
+    if not raw_dir.exists():
+        raise FileNotFoundError(f"Raw data dir not found: {raw_dir}")
+
+    cmd = [
+        sys.executable,
+        "data_utils/prepare_icesat_dualtask.py",
+        "--raw_dir",
+        str(raw_dir),
+        "--out_dir",
+        str(out_dir),
+        "--bin_size_m",
+        str(args.bin_size_m),
+        "--seq_length",
+        str(args.seq_length),
+        "--stride",
+        str(args.stride),
+        "--max_points_per_bin",
+        str(args.max_points_per_bin),
+        "--seed",
+        str(args.seed),
+    ]
+    print("[Data] train/val pkl not found, running preprocessing:")
+    print(" ", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_pkl", type=str, default="data/processed/train.pkl")
     parser.add_argument("--val_pkl", type=str, default="data/processed/val.pkl")
+    parser.add_argument("--raw_dir", type=str, default="data/raw")
+    parser.add_argument("--processed_dir", type=str, default="data/processed")
+    parser.add_argument("--prepare_if_missing", action="store_true")
+    parser.add_argument("--bin_size_m", type=float, default=0.5)
+    parser.add_argument("--seq_length", type=int, default=128)
+    parser.add_argument("--stride", type=int, default=64)
+    parser.add_argument("--max_points_per_bin", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
+
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -67,6 +116,8 @@ def main():
     parser.add_argument("--save_path", type=str, default="checkpoints/cgtc_net.pt")
     parser.add_argument("--mamba_layers", type=int, default=3)
     args = parser.parse_args()
+
+    maybe_prepare_data(args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_ds = ICESatDualTaskDataset(args.train_pkl, split="train", augment=True)
@@ -95,6 +146,7 @@ def main():
 
         if va["val_rmse"] < best_rmse:
             best_rmse = va["val_rmse"]
+            Path(args.save_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save({"model": model.state_dict(), "args": vars(args)}, args.save_path)
             print(f"Saved best checkpoint to {args.save_path}")
 
